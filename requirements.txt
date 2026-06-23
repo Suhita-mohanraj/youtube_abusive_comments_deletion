@@ -1,6 +1,7 @@
 streamlit==1.42.0
 transformers==4.49.0
 tensorflow==2.19.0
+tf-keras
 numpy==2.0.2
 google-auth
 google-auth-oauthlib
