@@ -1,17 +1,25 @@
 import streamlit as st
 from transformers import AlbertTokenizer, TFAutoModelForSequenceClassification
-import tensorflow as tf
 import numpy as np
-import tempfile
-import os
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+import google.oauth2.credentials
 
-# --- CONFIG ---
-MODEL_PATH = "model"  # Your model folder
+# ============================================================
+# CONFIG
+# ============================================================
+MODEL_PATH = "model"
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 
-# --- LOAD MODEL + TOKENIZER ---
+# This MUST exactly match the Authorized redirect URI you set
+# in Google Cloud Console (no trailing slash mismatch!).
+REDIRECT_URI = st.secrets["redirect_uri"]
+
+st.set_page_config(page_title="YouTube Abusive Comment Moderator", page_icon="🧹")
+
+# ============================================================
+# LOAD MODEL (cached so it only loads once)
+# ============================================================
 @st.cache_resource
 def load_model_and_tokenizer():
     tokenizer = AlbertTokenizer.from_pretrained(MODEL_PATH)
@@ -20,22 +28,51 @@ def load_model_and_tokenizer():
 
 tokenizer, model = load_model_and_tokenizer()
 
-# --- PREDICT FUNCTION ---
 def predict_abuse(text):
     inputs = tokenizer(text, return_tensors="tf", padding=True, truncation=True, max_length=512)
     logits = model(**inputs).logits
     pred = np.argmax(logits, axis=1)[0]
     return "Abusive" if pred == 1 else "Safe"
 
-# --- AUTHENTICATION FUNCTION ---
-def authenticate_youtube(client_secret_path):
-    flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
-    credentials = flow.run_local_server(port=0)
-    return build("youtube", "v3", credentials=credentials)
+# ============================================================
+# OAUTH HELPERS (Web flow — works on a deployed server)
+# ============================================================
+def build_flow():
+    """Builds the OAuth flow using client config from secrets.toml (no JSON file needed on disk)."""
+    client_config = {
+        "web": {
+            "client_id": st.secrets["google_client"]["client_id"],
+            "client_secret": st.secrets["google_client"]["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI],
+        }
+    }
+    return Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
-# --- FETCH COMMENTS FUNCTION ---
-def fetch_comments(youtube, video_id, max_results=20):
-    request = youtube.commentThreads().list(part="snippet", videoId=video_id, maxResults=max_results)
+def credentials_to_dict(credentials):
+    return {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+    }
+
+def get_youtube_client():
+    if "credentials" not in st.session_state:
+        return None
+    creds = google.oauth2.credentials.Credentials(**st.session_state["credentials"])
+    return build("youtube", "v3", credentials=creds)
+
+# ============================================================
+# YOUTUBE HELPERS
+# ============================================================
+def fetch_comments(youtube, video_id, max_results=50):
+    request = youtube.commentThreads().list(
+        part="snippet", videoId=video_id, maxResults=max_results, textFormat="plainText"
+    )
     response = request.execute()
     comments = []
     for item in response.get("items", []):
@@ -44,46 +81,66 @@ def fetch_comments(youtube, video_id, max_results=20):
         comments.append((cid, text))
     return comments
 
-# --- DELETE COMMENT FUNCTION ---
 def delete_comment(youtube, comment_id):
     youtube.comments().setModerationStatus(id=comment_id, moderationStatus="rejected").execute()
 
-# --- STREAMLIT UI ---
+# ============================================================
+# STREAMLIT UI
+# ============================================================
 st.title("🧹 YouTube Abusive Comment Auto-Moderator")
 
-# Upload client_secret.json
-client_file = st.file_uploader("Upload your Google client_secret.json", type=["json"])
-video_id = st.text_input("Enter YouTube Video ID")
+# Handle redirect back from Google (it appends ?code=... and ?state=... to the URL)
+query_params = st.query_params
 
-if st.button("Fetch, Classify & Auto-Delete Abusive Comments"):
-    if client_file is None or video_id.strip() == "":
-        st.warning("Please upload client_secret.json and enter a Video ID.")
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
-            tmp.write(client_file.read())
-            tmp_path = tmp.name
-
+if "credentials" not in st.session_state:
+    if "code" in query_params:
         try:
-            with st.spinner("Authenticating with YouTube..."):
-                youtube = authenticate_youtube(tmp_path)
+            flow = build_flow()
+            flow.fetch_token(code=query_params["code"])
+            st.session_state["credentials"] = credentials_to_dict(flow.credentials)
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Authentication failed: {e}")
+    else:
+        flow = build_flow()
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            include_granted_scopes="true",
+        )
+        st.write("Sign in with the Google account that owns the YouTube channel/video.")
+        st.link_button("🔐 Sign in with Google", auth_url)
 
-            with st.spinner("Fetching comments..."):
-                comments = fetch_comments(youtube, video_id)
-                st.success(f"✅ Fetched {len(comments)} comments.")
+else:
+    st.success("✅ Signed in to YouTube.")
+    if st.button("Sign out"):
+        del st.session_state["credentials"]
+        st.rerun()
 
-            st.subheader("🧪 Moderation Results")
+    video_id = st.text_input("Enter YouTube Video ID (the part after watch?v= in the URL)")
 
-            for cid, text in comments:
-                label = predict_abuse(text)
-                if label == "Abusive":
-                    st.error(f"[Abusive] {text}")
-                    try:
-                        delete_comment(youtube, cid)
-                        st.warning(f"🗑️ Deleted abusive comment: {cid}")
-                    except Exception as e:
-                        st.error(f"❌ Failed to delete comment {cid}: {e}")
-                else:
-                    st.info(f"[Safe] {text}")
+    if st.button("Fetch, Classify & Auto-Delete Abusive Comments"):
+        if video_id.strip() == "":
+            st.warning("Please enter a Video ID.")
+        else:
+            youtube = get_youtube_client()
+            try:
+                with st.spinner("Fetching comments..."):
+                    comments = fetch_comments(youtube, video_id)
+                st.success(f"Fetched {len(comments)} comments.")
 
-        finally:
-            os.remove(tmp_path)
+                st.subheader("🧪 Moderation Results")
+                for cid, text in comments:
+                    label = predict_abuse(text)
+                    if label == "Abusive":
+                        st.error(f"[Abusive] {text}")
+                        try:
+                            delete_comment(youtube, cid)
+                            st.warning(f"🗑️ Deleted comment: {cid}")
+                        except Exception as e:
+                            st.error(f"❌ Failed to delete comment {cid}: {e}")
+                    else:
+                        st.info(f"[Safe] {text}")
+            except Exception as e:
+                st.error(f"Error: {e}")
