@@ -96,7 +96,12 @@ if "credentials" not in st.session_state:
     if "code" in query_params:
         try:
             flow = build_flow()
-            flow.fetch_token(code=query_params["code"])
+            st.write("Verifier:", st.session_state.get("code_verifier"))
+            flow.code_verifier = st.session_state.get("code_verifier")
+
+            flow.fetch_token(
+                code=query_params["code"]
+            )
             st.session_state["credentials"] = credentials_to_dict(flow.credentials)
             st.query_params.clear()
             st.rerun()
@@ -104,11 +109,16 @@ if "credentials" not in st.session_state:
             st.error(f"Authentication failed: {e}")
     else:
         flow = build_flow()
-        auth_url, _ = flow.authorization_url(
+
+        auth_url, state = flow.authorization_url(
             access_type="offline",
             prompt="consent",
             include_granted_scopes="true",
         )
+
+        st.session_state["oauth_state"] = state
+        st.session_state["code_verifier"] = flow.code_verifier
+
         st.write("Sign in with the Google account that owns the YouTube channel/video.")
         st.link_button("🔐 Sign in with Google", auth_url)
 
